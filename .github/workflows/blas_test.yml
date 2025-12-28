@@ -1,0 +1,158 @@
+name: Full BLAS Suite Test (r2u)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-all-blas:
+    runs-on: ubuntu-latest
+    container: rocker/r2u:noble
+    strategy:
+      fail-fast: false
+      matrix:
+        blas-pkg: [
+          # BLIS
+          "libblis4-serial",
+          "libblis4-pthread",
+          "libblis4-openmp",
+          "libblis-serial-dev",
+          "libblis-pthread-dev",
+          "libblis-openmp-dev",
+
+          # OpenBLAS
+          "libopenblas0-serial",
+          "libopenblas0-pthread",
+          "libopenblas0-openmp",
+          # "libopenblas-serial-dev",
+          # "libopenblas-pthread-dev",
+          # "libopenblas-openmp-dev",
+
+          # Reference BLAS
+          "libblas3",
+          # "libblas-dev",
+
+          # ATLAS
+          "libatlas3-base",
+
+          # Intel MKL
+          "intel-mkl"
+        ]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install BLAS and Rcpp
+        run: |
+          apt-get update
+          apt-get install -y ${{ matrix.blas-pkg }} r-cran-rcpp
+
+      - name: Switch BLAS Implementation
+        shell: bash
+        run: |
+          set -e
+
+          PKG="${{ matrix.blas-pkg }}"
+          echo "Configuring BLAS for $PKG"
+
+          if [[ "$PKG" == "intel-mkl" ]]; then
+            MKL_SO=$(ldconfig -p | awk '/libmkl_rt.so/{print $NF}' | head -n1)
+            if [[ -z "$MKL_SO" || ! -f "$MKL_SO" ]]; then
+              echo "ERROR: libmkl_rt.so not found"
+              exit 1
+            fi
+            echo "CUSTOM_PRELOAD=$MKL_SO" >> "$GITHUB_ENV"
+            
+          elif [[ "$PKG" == libblis* ]]; then
+            BLIS_SO=$(ldconfig -p | awk '/libblis.so.4/{print $NF}' | head -n1)
+            if [[ -z "$BLIS_SO" || ! -f "$BLIS_SO" ]]; then
+              echo "ERROR: libblis.so.4 not found"
+              exit 1
+            fi
+            echo "CUSTOM_PRELOAD=$BLIS_SO" >> "$GITHUB_ENV"
+
+          else
+            BLAS_SO=$(dpkg -L "$PKG" | grep '/libblas.so.3$' | head -n1)
+            if [[ -z "$BLAS_SO" ]]; then
+              echo "ERROR: libblas.so.3 not found in $PKG"
+              exit 1
+            fi
+            update-alternatives --set libblas.so.3-x86_64-linux-gnu "$BLAS_SO"
+            echo "BLAS switched to $BLAS_SO"
+          fi
+
+      - name: Run IEEE-754 Safety Test
+        run: |
+          LD_PRELOAD=${{ env.CUSTOM_PRELOAD }} Rscript -e '
+          library(Rcpp)
+          Sys.setenv(
+            PKG_CXXFLAGS = "-Wno-error=format-security -Wno-format-security -Wno-format"
+          )
+          Rcpp::sourceCpp(code = "
+            #include <Rcpp.h>
+            #include <R_ext/BLAS.h>
+            
+            // [[Rcpp::export]]
+            double blas_dot_product(Rcpp::NumericVector a, Rcpp::NumericVector b) {
+              int n = a.size();
+              if (n != b.size()) {
+                Rcpp::stop(\"Incompatible lengths: vectors must be the same size.\");
+              }
+            
+              int inc = 1;
+              // ddot(n, x, incx, y, incy)
+              double result = F77_CALL(ddot)(&n, a.begin(), &inc, b.begin(), &inc);
+            
+              return result;
+            }
+          ")
+
+          cat("\n--- Testing implementation: ${{ matrix.blas-pkg }} ---\n")
+          cat("Active BLAS vendor: ", extSoftVersion()["BLAS"], "\n")
+          
+          # 1. check NA
+          a <- c(1, NA, 2); b <- c(1, 2, 3)
+          if(!identical(blas_dot_product(a, b), NA_real_)) stop("Failed NA check")
+          cat("check NA:       PASS\n")
+
+          # 2. check NaN 
+          a <- c(1, NaN, 2); b <- c(1, 2, 3)
+          if(!identical(blas_dot_product(a, b), NaN)) stop("Failed NaN check")
+          cat("check NaN:      PASS\n")
+
+          # 3. check Inf
+          a <- c(1, Inf, 2); b <- c(1, 2, 3)
+          if(!identical(blas_dot_product(a, b), Inf)) stop("Failed Inf check")
+          cat("check Inf:      PASS\n")
+
+          # 4. check -Inf
+          a <- c(1, -Inf, 2); b <- c(1, 2, 3)
+          if(!identical(blas_dot_product(a, b), -Inf)) stop("Failed -Inf check")
+          cat("check -Inf:     PASS\n")
+
+          # 5. check Standard
+          a <- c(1, 2, 2); b <- c(1, 2, 3)
+          if(!identical(blas_dot_product(a, b), 11.0)) stop("Failed Std check")
+          cat("check Std:      PASS\n")
+
+          # 6. TRAP: Zero * NA 
+          a <- c(0, 1); b <- c(NA, 1)
+          res_na <- blas_dot_product(a, b)
+          if(!is.na(res_na)) stop(paste("TRAP FAIL: 0*NA produced", res_na))
+          cat("TRAP 0*NA:      PASS\n")
+
+          # 7. TRAP: Zero * Inf
+          a <- c(0, 1); b <- c(Inf, 1)
+          res_inf <- blas_dot_product(a, b)
+          if(!is.na(res_inf)) stop(paste("TRAP FAIL: 0*Inf produced", res_inf))
+          cat("TRAP 0*Inf:     PASS\n")
+
+          # 8. TRAP: Zero * -Inf
+          a <- c(0, 1); b <- c(-Inf, 1)
+          res_neginf <- blas_dot_product(a, b)
+          if(!is.na(res_neginf)) stop(paste("TRAP FAIL: 0*-Inf produced", res_neginf))
+          cat("TRAP 0*-Inf:    PASS\n")
+          '
